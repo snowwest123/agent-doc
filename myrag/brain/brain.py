@@ -274,6 +274,44 @@ class Brain:
      
         return await self.llm.ainvoke(messages)
 
+    async def suggest_questions(self, count: int = 5) -> list[str]:
+        """基于已上传文档生成可提问问题。"""
+        docs = await self._retrieve_docs("概括这些文档中最值得追问的主题")
+        context = self._build_context(docs)
+        messages = [
+            SystemMessage(content=(
+                "你是文档问答助手，需要基于给定文档生成用户可以直接点击提问的问题。"
+                "只返回 JSON 字符串数组，不要返回 Markdown，不要返回解释。"
+                f"数组长度最多 {count} 个，问题必须具体、自然，并且能从文档中找到依据。\n\n"
+                f"文档内容：\n{context}"
+            )),
+            HumanMessage(content="请生成可提问问题。"),
+        ]
+        text = await self.llm.ainvoke(messages)
+        return self._parse_suggested_questions(text, count)
+
+    def _parse_suggested_questions(self, text: str, count: int) -> list[str]:
+        try:
+            match = re.search(r"\[.*\]", text, re.DOTALL)
+            raw = json.loads(match.group() if match else text)
+            questions = [str(item).strip() for item in raw if str(item).strip()]
+        except Exception:
+            questions = [
+                line.strip(" -0123456789.、\t")
+                for line in text.splitlines()
+                if line.strip(" -0123456789.、\t")
+            ]
+        seen: set[str] = set()
+        result: list[str] = []
+        for question in questions:
+            if question in seen:
+                continue
+            seen.add(question)
+            result.append(question)
+            if len(result) >= count:
+                break
+        return result
+
 
     async def ask_streaming(self, question: str):
         """流式问答：逐 chunk 返回答案。

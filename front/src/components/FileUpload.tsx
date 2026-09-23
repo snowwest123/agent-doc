@@ -1,10 +1,10 @@
 import { useRef, useState } from 'react';
 import { Upload, FileText, X } from 'lucide-react';
-import { uploadFiles } from '../api';
+import { getSuggestedQuestions, uploadFiles } from '../api';
 
 interface Props {
   sessionId: string;
-  onUploaded: () => void;
+  onUploaded: (questions: string[]) => void;
 }
 
 export default function FileUpload({ sessionId, onUploaded }: Props) {
@@ -17,8 +17,9 @@ export default function FileUpload({ sessionId, onUploaded }: Props) {
     setUploading(true);
     try {
       await uploadFiles(sessionId, files);
+      const questions = await getSuggestedQuestions(sessionId);
       setFiles([]);
-      onUploaded();
+      onUploaded(questions);
     } catch (err) {
       alert(`上传失败：${(err as Error).message}`);
     } finally {

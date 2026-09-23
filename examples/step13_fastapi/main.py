@@ -136,6 +136,10 @@ class AskResponse(BaseModel):
     answer: str
     session_id: str
 
+class SuggestedQuestionsResponse(BaseModel):
+    session_id: str
+    questions: list[str]
+
 class BrainInfo(BaseModel):
     session_id: str
     name: str
@@ -408,6 +412,28 @@ async def ask(req: AskRequest) -> AskResponse:
     await _append_history(req.session_id, "user", req.question)
     await _append_history(req.session_id, "assistant", answer)
     return AskResponse(answer=answer, session_id=req.session_id)
+
+
+@app.get("/sessions/{session_id}/suggested-questions", response_model=SuggestedQuestionsResponse, dependencies=[Depends(verify_api_key)])
+async def suggested_questions(session_id: str, count: int = 5) -> SuggestedQuestionsResponse:
+    """基于当前 session 的文档生成可点击的问题。"""
+    if count < 1 or count > 10:
+        raise HTTPException(400, "count 必须在 1 到 10 之间")
+    rds = redis_client.client
+    session_key = K_SESSION.format(sid=session_id)
+    raw = await rds.hgetall(session_key)
+    if not raw:
+        raise HTTPException(404, "session 不存在")
+    if int(raw.get("nb_chunks", 0)) <= 0:
+        return SuggestedQuestionsResponse(session_id=session_id, questions=[])
+    brain = brain_repo.get(session_id) or await brain_repo.load_or_create(
+        session_id,
+        raw.get("brain_name", "MyRAG Brain"),
+        LLMEndpoint.from_env(),
+        DashScopeEmbedder.from_env(),
+    )
+    questions = await brain.suggest_questions(count=count)
+    return SuggestedQuestionsResponse(session_id=session_id, questions=questions)
 
 
 @app.post("/ask_stream", dependencies=[Depends(verify_api_key)])

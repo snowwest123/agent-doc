@@ -47,6 +47,19 @@ export async function uploadFiles(
   return r.json()
 }
 
+export async function getSuggestedQuestions(
+  sid: string,
+  count = 5,
+): Promise<string[]> {
+  const r = await fetch(
+    `${BASE}/sessions/${sid}/suggested-questions?count=${count}`,
+    { headers: headers() },
+  )
+  if (!r.ok) throw new Error(`suggestedQuestions ${r.status}`)
+  const data: { questions: string[] } = await r.json()
+  return data.questions
+}
+
 export async function askStream(
   sid: string,
   question: string,
