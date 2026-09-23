@@ -1,28 +1,28 @@
-import { useRef, useState } from 'react'
-import { Upload, FileText, X } from 'lucide-react'
-import { uploadFiles } from '../api'
+import { useRef, useState } from 'react';
+import { Upload, FileText, X } from 'lucide-react';
+import { uploadFiles } from '../api';
 
 interface Props {
-  sessionId: string
-  onUploaded: () => void
+  sessionId: string;
+  onUploaded: () => void;
 }
 
 export default function FileUpload({ sessionId, onUploaded }: Props) {
-  const [files, setFiles] = useState<File[]>([])
-  const [uploading, setUploading] = useState(false)
-  const inputRef = useRef<HTMLInputElement>(null)
+  const [files, setFiles] = useState<File[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   async function handleUpload() {
-    if (files.length === 0) return
-    setUploading(true)
+    if (files.length === 0) return;
+    setUploading(true);
     try {
-      await uploadFiles(sessionId, files)
-      setFiles([])
-      onUploaded()
+      await uploadFiles(sessionId, files);
+      setFiles([]);
+      onUploaded();
     } catch (err) {
-      alert(`上传失败：${(err as Error).message}`)
+      alert(`上传失败：${(err as Error).message}`);
     } finally {
-      setUploading(false)
+      setUploading(false);
     }
   }
 
@@ -33,7 +33,7 @@ export default function FileUpload({ sessionId, onUploaded }: Props) {
           onClick={() => inputRef.current?.click()}
           className="flex items-center gap-1 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 rounded-md text-sm"
         >
-          <Upload className="w-4 h-4" /> 选择文件
+          <Upload className="w-4 h-4" /> 请选择文件
         </button>
         <input
           ref={inputRef}
@@ -65,5 +65,5 @@ export default function FileUpload({ sessionId, onUploaded }: Props) {
         )}
       </div>
     </div>
-  )
+  );
 }
