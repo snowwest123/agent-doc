@@ -121,11 +121,11 @@ class Brain:
 
         vector_store = None
         if use_vector_store:
-            from myrag.vectorstore.faiss_store import FAISSStore
             if embedder is None:
                 from myrag.embedding.dashscope_embedder import DashScopeEmbedder
                 embedder = DashScopeEmbedder.from_env()
-            vector_store = FAISSStore(embedder=embedder)
+            from myrag.vectorstore.factory import create_vector_store
+            vector_store = create_vector_store(embedder, str(uuid.uuid4()))
             await vector_store.add_documents(all_docs)
 
         retrieval_config = (

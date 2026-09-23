@@ -2,6 +2,8 @@ import { useRef, useState } from 'react';
 import { Upload, FileText, X } from 'lucide-react';
 import { getSuggestedQuestions, uploadFiles } from '../api';
 
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
+
 interface Props {
   sessionId: string;
   onUploaded: (questions: string[]) => void;
@@ -42,7 +44,18 @@ export default function FileUpload({ sessionId, onUploaded }: Props) {
           multiple
           accept=".txt,.md,.csv"
           hidden
-          onChange={(e) => setFiles(Array.from(e.target.files || []))}
+          onChange={(e) => {
+            const selectedFiles = Array.from(e.target.files || []);
+            const invalidFile = selectedFiles.find(
+              (file) => file.size > MAX_FILE_SIZE,
+            );
+            if (invalidFile) {
+              alert(`文件 ${invalidFile.name} 超过 10 MB 限制`);
+              e.target.value = '';
+              return;
+            }
+            setFiles(selectedFiles);
+          }}
         />
         {files.map((f) => (
           <span

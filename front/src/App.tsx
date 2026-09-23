@@ -3,6 +3,7 @@ import Sidebar from './components/Sidebar';
 import ChatWindow from './components/ChatWindow';
 import FileUpload from './components/FileUpload';
 import InputBar from './components/InputBar';
+import { Button, Input, Modal } from 'antd';
 import {
   createSession,
   deleteSession as apiDeleteSession,
@@ -11,6 +12,7 @@ import {
 } from './api';
 import type { Message, SessionInfo } from './types';
 import { useStream } from './hooks/useStream';
+import testDocUrl from './components/assistant_test_doc.txt?url';
 
 const SESSIONS_KEY = 'myrag_sessions';
 
@@ -21,6 +23,9 @@ export default function App() {
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
   const [brainInfo, setBrainInfo] = useState<SessionInfo | null>(null);
   const [suggestedQuestions, setSuggestedQuestions] = useState<string[]>([]);
+  const [createModalOpen, setCreateModalOpen] = useState(false);
+  const [brainName, setBrainName] = useState('MyRAG Brain');
+  const [creating, setCreating] = useState(false);
   const { streaming, start, stop } = useStream();
 
   useEffect(() => {
@@ -57,12 +62,23 @@ export default function App() {
     localStorage.setItem(SESSIONS_KEY, JSON.stringify(list));
   };
 
-  const handleCreate = async () => {
-    const name = prompt('给这个 Brain 起个名字', 'MyRAG Brain');
-    if (!name) return;
-    const s = await createSession(name);
-    persistSessions([s, ...sessions]);
-    setCurrentSid(s.session_id);
+  const handleCreate = () => {
+    setBrainName('MyRAG Brain');
+    setCreateModalOpen(true);
+  };
+
+  const handleCreateSubmit = async () => {
+    const name = brainName.trim();
+    if (!name || creating) return;
+    setCreating(true);
+    try {
+      const s = await createSession(name);
+      persistSessions([s, ...sessions]);
+      setCurrentSid(s.session_id);
+      setCreateModalOpen(false);
+    } finally {
+      setCreating(false);
+    }
   };
 
   const handleDelete = async (sid: string) => {
@@ -121,6 +137,26 @@ export default function App() {
         onDelete={handleDelete}
         backendOk={backendOk}
       />
+      <Modal
+        title="创建 Brain"
+        open={createModalOpen}
+        onOk={handleCreateSubmit}
+        onCancel={() => setCreateModalOpen(false)}
+        okText="创建"
+        cancelText="取消"
+        confirmLoading={creating}
+        destroyOnClose
+      >
+        <Input
+          autoFocus
+          value={brainName}
+          placeholder="请输入 Brain 名称"
+          maxLength={50}
+          showCount
+          onChange={(event) => setBrainName(event.target.value)}
+          onPressEnter={handleCreateSubmit}
+        />
+      </Modal>
       <main className="flex-1 flex flex-col bg-slate-50">
         {currentSid && brainInfo ? (
           <>
@@ -131,6 +167,17 @@ export default function App() {
               <p className="text-xs text-slate-500">
                 {brainInfo.nb_chunks} chunks · {brainInfo.files.length} files
               </p>
+              <p className="mt-1 text-xs text-slate-400">
+                支持格式：TXT 单个文件最大 10 MB
+              </p>
+              <Button
+                type="link"
+                href={testDocUrl}
+                download="assistant_test_doc.txt"
+                className="h-auto p-0 text-xs"
+              >
+                下载测试文件（方便上传知识库）
+              </Button>
             </header>
             <FileUpload sessionId={currentSid} onUploaded={handleUploaded} />
             <ChatWindow

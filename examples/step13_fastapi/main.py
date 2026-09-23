@@ -12,7 +12,7 @@
 
 架构：
   - Redis：存会话元信息 / 聊天历史 / 上传文件元信息
-  - volume (/app/data)：存原始上传文件 + FAISS 索引
+  - volume (/app/data)：存原始上传文件；FAISS 模式下也保存本地索引
   - 每个 session_id 独立一个 Brain，多租户隔离
 """
 from __future__ import annotations
@@ -36,11 +36,13 @@ from myrag.brain import Brain
 from myrag.embedding.dashscope_embedder import DashScopeEmbedder
 from myrag.llm import LLMEndpoint
 from myrag.processor.registry import ProcessorRegistry
+from myrag.vectorstore.factory import create_vector_store, is_hologres_vector_store
 
 # ===== 路径 / 持久化常量 =====
 DATA_DIR = Path(os.getenv("MYRAG_DATA_DIR", "/app/data"))
 UPLOADS_DIR = DATA_DIR / "uploads"
 FAISS_DIR = DATA_DIR / "faiss"
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_BYTES", str(10 * 1024 * 1024)))
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
@@ -150,7 +152,7 @@ class BrainInfo(BaseModel):
 
 # ===== Brain 仓库（In-memory cache，避免重复重建）=====
 class BrainRepo:
-    """Brain 句柄缓存：重启后从 Redis + FAISS 重建。"""
+    """Brain 句柄缓存：重启后从 Redis + 向量库重建。"""
 
     def __init__(self) -> None:
         self._cache: dict[str, Brain] = {}
@@ -176,11 +178,24 @@ class BrainRepo:
         if brain:
             return brain
 
-        # 尝试从磁盘 + Redis 元信息重建
-        faiss_path = FAISS_DIR / session_id
         rds = redis_client.client
         session_key = K_SESSION.format(sid=session_id)
         raw = await rds.hgetall(session_key)
+        if raw and is_hologres_vector_store():
+            from myrag.storage import LocalStorage
+            brain = Brain(
+                name=brain_name,
+                llm=llm,
+                storage=LocalStorage(UPLOADS_DIR / session_id),
+                brain_id=uuid.UUID(raw.get("brain_id", str(uuid.uuid4()))),
+            )
+            brain.vector_store = create_vector_store(embedder, session_id)
+            self.put(session_id, brain)
+            print(f"♻️ 从 Hologres 重建 Brain: {session_id}")
+            return brain
+
+        # 尝试从磁盘 + Redis 元信息重建
+        faiss_path = FAISS_DIR / session_id
         if raw and faiss_path.exists():
             # 有持久化索引 + Redis 元信息 → 重建
             from myrag.storage import LocalStorage
@@ -216,7 +231,7 @@ brain_repo = BrainRepo()
 
 async def _save_faiss_async(brain: Brain, session_id: str) -> None:
     """后台任务：异步保存 FAISS 索引到磁盘（不阻塞响应）。"""
-    if brain.vector_store is None:
+    if brain.vector_store is None or is_hologres_vector_store():
         return
     faiss_path = FAISS_DIR / session_id
     faiss_path.mkdir(parents=True, exist_ok=True)
@@ -314,6 +329,11 @@ async def delete_session(session_id: str) -> dict[str, str]:
     faiss_path = FAISS_DIR / session_id
     if faiss_path.exists():
         shutil.rmtree(faiss_path, ignore_errors=True)
+    if is_hologres_vector_store():
+        embedder = DashScopeEmbedder.from_env()
+        vector_store = create_vector_store(embedder, session_id)
+        if hasattr(vector_store, "delete_tenant"):
+            await vector_store.delete_tenant()
     return {"deleted": session_id}
 
 
@@ -340,9 +360,10 @@ async def upload(
         if ext not in {".txt", ".md", ".csv"}:
             raise HTTPException(400, f"不支持的文件类型：{ext}")
         dst = session_upload_dir / f"{uuid.uuid4()}{ext}"
-        with dst.open("wb", encoding=None) as f:
-            content = await upload_file.read()
-            f.write(content)
+        content = await upload_file.read()
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(413, f"文件大小不能超过 {MAX_UPLOAD_SIZE // (1024 * 1024)} MB")
+        dst.write_bytes(content)
         saved_paths.append(dst)
 
     # 2. 重建/获取 Brain
@@ -367,8 +388,7 @@ async def upload(
     if new_docs:
         brain.knowledge.extend(new_docs)
         if brain.vector_store is None:
-            from myrag.vectorstore.faiss_store import FAISSStore
-            brain.vector_store = FAISSStore(embedder=embedder)
+            brain.vector_store = create_vector_store(embedder, session_id)
         await brain.vector_store.add_documents(new_docs)
         await _save_faiss_async(brain, session_id)
 
