@@ -25,6 +25,9 @@ FROM ${PYTHON_IMAGE} AS api
 # 设置工作目录
 WORKDIR /app
 
+# 使用国内 Debian 镜像源，加速 Linux 服务器上的 apt 依赖安装
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources
+
 # 系统依赖（psycopg 需要 libpq；faiss-cpu 需要 libgomp1；healthcheck 需要 curl）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev gcc libgomp1 curl \
