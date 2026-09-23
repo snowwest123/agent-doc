@@ -1,0 +1,11 @@
+__pycache__
+*.pyc
+.venv
+.env.example
+*.log
+.DS_Store
+front/node_modules
+front/.npm-cache
+front/dist
+examples/step*
+!examples/step13_fastapi/

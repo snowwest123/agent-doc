@@ -1,0 +1,21 @@
+[project]
+name = "myrag"
+version = "0.0.1"
+description = "A minimal RAG framework, inspired by quivr-core"
+requires-python = ">= 3.11"
+dependencies = [
+    "pydantic>=2.8",
+    "langchain-core>=0.3,<0.4",
+    "langchain-openai>=0.3,<0.4",
+    "python-dotenv>=1.0",
+    "tiktoken>=0.7",
+    "rich>=13.7",
+    "redis>=5.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["myrag"]

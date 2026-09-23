@@ -1,0 +1,27 @@
+# Retrieval 工作流配置
+# 改完这个文件，Brain 会用新的参数检索（不用重启代码）
+
+llm:
+  model: qwen-plus
+  temperature: 0.3
+  max_tokens: 4096
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+# 检索策略开关
+use_vector: true
+use_bm25: true
+use_rerank: true # 设为 false 可以跳过 rerank
+
+# 召回数量
+k_vector: 50
+k_bm25: 50
+k_final: 5
+
+# 分数阈值
+score_threshold: 0.0
+
+# 自定义 system prompt
+system_prompt: |
+  你是「{brain_name}」——一个基于文档回答问题的助手。
+  请只根据下面的文档内容回答，不要编造。
+  如果文档里没有答案，请直接说「我不知道」。
