@@ -42,7 +42,7 @@ pip config set global.timeout 120 && \
 pip install --no-cache-dir --upgrade pip && \
 pip install --no-cache-dir --timeout 120 --retries 5 \
     "fastapi" "uvicorn[standard]" "python-multipart" \
-    "psycopg[binary]>=0.3,<0.4" "langchain-core>=0.3,<0.4" "langchain-openai>=0.3,<0.4" \
+    "psycopg[binary]>=3.1,<4" "langchain-core>=0.3,<0.4" "langchain-openai>=0.3,<0.4" \
     "langchain-community" "langgraph" "duckdb" "tiktoken" "pydantic>=2.8" \
     "pyyaml" "dashscope" "faiss-cpu" "rich" "python-dotenv" "nest_asyncio" "redis>=5.0"
 
