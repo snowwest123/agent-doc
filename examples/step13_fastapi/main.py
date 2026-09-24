@@ -2,23 +2,29 @@
 
 端点：
   POST /sessions          创建会话
-  POST /upload           上传文档（绑定到 session）
-  POST /ask              同步问答
-  POST /ask_stream       SSE 流式问答
-  GET  /info             Brain 状态
-  GET  /sessions/{sid}   会话信息
-  DELETE /sessions/{sid} 删会话
-  GET  /health           健康检查
+  GET  /sessions          会话列表（持久化于 Hologres / Redis）
+  POST /upload            上传文档（绑定到 session）
+  POST /ask               同步问答
+  POST /ask_stream        SSE 流式问答
+  GET  /info              Brain 状态
+  GET  /sessions/{sid}    会话信息
+  GET  /sessions/{sid}/history   聊天历史
+  DELETE /sessions/{sid}  删会话
+  GET  /health            健康检查
 
 架构：
-  - Redis：存会话元信息 / 聊天历史 / 上传文件元信息
-  - volume (/app/data)：存原始上传文件；FAISS 模式下也保存本地索引
-  - 每个 session_id 独立一个 Brain，多租户隔离
+  - Hologres：会话元数据（session_id / brain_name / created_at / nb_chunks / files / brain_id）
+              永久存储，Redis 重启 / 服务重启后自动恢复。
+  - Redis：运行时缓存（启动时从 Hologres 恢复）+ 聊天历史 + 文件名 set。
+  - volume (/app/data)：存原始上传文件；FAISS 模式下也保存本地索引。
+  - 每个 session_id 独立一个 Brain，多租户隔离。
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import shutil
 import uuid
 from contextlib import asynccontextmanager
@@ -26,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import psycopg
 import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,9 +56,225 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 
 # session 在 Redis 里的 key 前缀
-K_SESSION = "myrag:session:{sid}"   # hash：brain_name / created_at / nb_chunks / files
+K_SESSION = "myrag:session:{sid}"   # hash：brain_name / created_at / nb_chunks / files / brain_id / owner_id
 K_FILES = "myrag:session:{sid}:files"  # set：上传过的文件名
 K_HISTORY = "myrag:session:{sid}:history"  # list：聊天历史（JSON 序列化）
+
+# 当请求没带 API Key 且后端也没配置 MY_API_KEY 时使用此共享 owner（向后兼容单租户场景）。
+SHARED_OWNER = "__shared__"
+
+
+# ===== Hologres 会话元数据表（永久存储）=====
+
+HOLOGRES_SESSION_TABLE = os.getenv("HOLOGRES_SESSION_TABLE", "myrag_sessions")
+if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", HOLOGRES_SESSION_TABLE):
+    raise ValueError("HOLOGRES_SESSION_TABLE 只能是字母、数字和下划线，且首字符为字母/下划线")
+
+
+class HologresSessionStore:
+    """将会话元数据（brain_name / created_at / nb_chunks / files / brain_id / owner_id）持久化到 Hologres。
+
+    设计要点：
+    - 单表 myrag_sessions，session_id 为主键；
+    - 写入采用 UPSERT，重启后可直接 SELECT 出来回填；
+    - 仅当 VECTOR_STORE=hologres 时启用持久化（因为用户已配置 Hologres 连接信息）；
+    - 支持 owner 隔离：upsert 必须带 owner_id；list/get/delete 都按 owner 校验。
+    """
+
+    def __init__(self) -> None:
+        self.table = HOLOGRES_SESSION_TABLE
+
+    def _connect(self):
+        host = os.getenv("HOLOGRES_HOST")
+        if not host:
+            raise ValueError("启用 Hologres 会话持久化需要设置 HOLOGRES_HOST")
+        return psycopg.connect(
+            host=host,
+            port=int(os.getenv("HOLOGRES_PORT", "80")),
+            dbname=os.getenv("HOLOGRES_DB", ""),
+            user=os.getenv("HOLOGRES_USER", ""),
+            password=os.getenv("HOLOGRES_PASSWORD", ""),
+            connect_timeout=int(os.getenv("HOLOGRES_CONNECT_TIMEOUT", "10")),
+        )
+
+    def _ensure_table(self) -> None:
+        """幂等地创建/升级 myrag_sessions 表。
+
+        Hologres 限制：
+        - ADD COLUMN 不能再带 NOT NULL DEFAULT
+        - 不支持 ALTER COLUMN SET NOT NULL
+        - 不支持 ALTER COLUMN DROP DEFAULT
+        所以 owner_id 在 schema 层保持 nullable，**应用层强制非空**（每次 upsert 都传）。
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self.table} (
+                    session_id   TEXT NOT NULL,
+                    brain_name   TEXT NOT NULL,
+                    created_at   TIMESTAMPTZ NOT NULL,
+                    nb_chunks    INTEGER NOT NULL DEFAULT 0,
+                    files        TEXT NOT NULL DEFAULT '',
+                    brain_id     TEXT,
+                    PRIMARY KEY (session_id)
+                )
+                """
+            )
+            conn.commit()
+
+            # 兼容旧表：单独执行 ALTER，每条包 try/except，单条失败不影响后续。
+            self._safe_alter(cur, conn,
+                f"ALTER TABLE {self.table} "
+                f"ADD COLUMN IF NOT EXISTS owner_id TEXT DEFAULT '__shared__'"
+            )
+            self._safe_alter(cur, conn,
+                f"UPDATE {self.table} SET owner_id = '__shared__' "
+                f"WHERE owner_id IS NULL"
+            )
+            self._safe_alter(cur, conn,
+                f"CREATE INDEX IF NOT EXISTS {self.table}_owner_idx "
+                f"ON {self.table}(owner_id)"
+            )
+
+    @staticmethod
+    def _safe_alter(cur, conn, sql: str) -> None:
+        """执行 DDL，FeatureNotSupported / DuplicateObject / AlreadyExists 等一律吞掉。
+
+        Hologres 不同版本对外暴露的限制不一致，逐条幂等执行比一次性脚本更稳。
+        """
+        try:
+            cur.execute(sql)
+            conn.commit()
+        except Exception as e:  # noqa: BLE001
+            conn.rollback()
+            print(f"[WARN] skip DDL ({type(e).__name__}): {sql.splitlines()[0]}")
+
+    async def ensure_table(self) -> None:
+        await asyncio.to_thread(self._ensure_table)
+
+    def _upsert(self, data: dict[str, Any]) -> None:
+        self._ensure_table()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {self.table}
+                    (session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (session_id) DO UPDATE SET
+                    owner_id   = EXCLUDED.owner_id,
+                    brain_name = EXCLUDED.brain_name,
+                    nb_chunks  = EXCLUDED.nb_chunks,
+                    files      = EXCLUDED.files,
+                    brain_id   = COALESCE(EXCLUDED.brain_id, {self.table}.brain_id)
+                """,
+                (
+                    data["session_id"],
+                    data.get("owner_id") or "__shared__",
+                    data["brain_name"],
+                    data["created_at"],
+                    int(data.get("nb_chunks", 0)),
+                    data.get("files", "") or "",
+                    data.get("brain_id") or None,
+                ),
+            )
+            conn.commit()
+
+    async def upsert(self, data: dict[str, Any]) -> None:
+        await asyncio.to_thread(self._upsert, data)
+
+    def _delete(self, session_id: str, owner_id: str | None) -> None:
+        with self._connect() as conn, conn.cursor() as cur:
+            if owner_id is None:
+                cur.execute(f"DELETE FROM {self.table} WHERE session_id = %s", (session_id,))
+            else:
+                cur.execute(
+                    f"DELETE FROM {self.table} WHERE session_id = %s AND owner_id = %s",
+                    (session_id, owner_id),
+                )
+            conn.commit()
+
+    async def delete(self, session_id: str, owner_id: str | None = None) -> None:
+        await asyncio.to_thread(self._delete, session_id, owner_id)
+
+    def _list_all(self, owner_id: str | None) -> list[dict[str, Any]]:
+        self._ensure_table()
+        with self._connect() as conn, conn.cursor() as cur:
+            if owner_id is None:
+                cur.execute(
+                    f"""
+                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id
+                    FROM {self.table}
+                    ORDER BY created_at DESC
+                    """
+                )
+            else:
+                cur.execute(
+                    f"""
+                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id
+                    FROM {self.table}
+                    WHERE owner_id = %s
+                    ORDER BY created_at DESC
+                    """,
+                    (owner_id,),
+                )
+            rows = cur.fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            session_id, owner, brain_name, created_at, nb_chunks, files, brain_id = row
+            result.append(
+                {
+                    "session_id": session_id,
+                    "owner_id": owner or "__shared__",
+                    "brain_name": brain_name,
+                    "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+                    "nb_chunks": int(nb_chunks or 0),
+                    "files": files or "",
+                    "brain_id": brain_id or "",
+                }
+            )
+        return result
+
+    async def list_all(self, owner_id: str | None = None) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_all, owner_id)
+
+    def _get_one(self, session_id: str, owner_id: str | None) -> dict[str, Any] | None:
+        with self._connect() as conn, conn.cursor() as cur:
+            if owner_id is None:
+                cur.execute(
+                    f"""
+                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id
+                    FROM {self.table} WHERE session_id = %s
+                    """,
+                    (session_id,),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id
+                    FROM {self.table}
+                    WHERE session_id = %s AND owner_id = %s
+                    """,
+                    (session_id, owner_id),
+                )
+            row = cur.fetchone()
+        if not row:
+            return None
+        sid, owner, brain_name, created_at, nb_chunks, files, brain_id = row
+        return {
+            "session_id": sid,
+            "owner_id": owner or "__shared__",
+            "brain_name": brain_name,
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+            "nb_chunks": int(nb_chunks or 0),
+            "files": files or "",
+            "brain_id": brain_id or "",
+        }
+
+    async def get_one(self, session_id: str, owner_id: str | None = None) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_one, session_id, owner_id)
+
+
+hologres_sessions = HologresSessionStore()
 
 
 # ===== Redis 客户端（单例）=====
@@ -80,9 +303,31 @@ class RedisClient:
 redis_client = RedisClient()
 
 
-# ===== 鉴权 =====
+# ===== 鉴权 + owner 解析 =====
+
+class OwnerIdentity(BaseModel):
+    """当前请求所属 owner：每个 owner 看到的是完全隔离的会话空间。"""
+    owner_id: str
+
+
+async def resolve_owner(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> OwnerIdentity:
+    """从 API Key 解析 owner_id：相同 Key 永远解析到同一 owner；无 Key 时退化为共享 owner。"""
+    expected = os.getenv("MY_API_KEY")
+    if expected:
+        if x_api_key != expected:
+            raise HTTPException(status_code=401, detail="Invalid API Key")
+        # 用 API Key 自身的 SHA1 前缀当 owner：相同 Key 始终命中同一桶，简单且不会泄漏原 Key。
+        import hashlib
+        owner_id = "key_" + hashlib.sha1(expected.encode("utf-8")).hexdigest()[:12]
+        return OwnerIdentity(owner_id=owner_id)
+    # 没配 MY_API_KEY：本地开发模式，全部归到共享 owner，方便多人共用一个 Hologres。
+    return OwnerIdentity(owner_id=SHARED_OWNER)
+
+
 async def verify_api_key(x_api_key: str | None = Header(default=None)) -> None:
-    """简易 API Key 鉴权，防止公网被无限制调。"""
+    """仅做鉴权，不暴露 owner；用于 /info、/health 这类不需要 owner 的端点。"""
     expected = os.getenv("MY_API_KEY")
     if expected and x_api_key != expected:
         raise HTTPException(status_code=401, detail="Invalid API Key")
@@ -97,6 +342,25 @@ async def lifespan(app: FastAPI):
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     FAISS_DIR.mkdir(parents=True, exist_ok=True)
     await redis_client.connect()
+    if is_hologres_vector_store():
+        await hologres_sessions.ensure_table()
+        # lifespan 全量恢复：用 owner_id 做 set 成员关系，session 写入 redis 时再 hash 化 owner。
+        sessions = await hologres_sessions.list_all()
+        rds = redis_client.client
+        for s in sessions:
+            owner_id = s.get("owner_id") or SHARED_OWNER
+            await rds.hset(K_SESSION.format(sid=s["session_id"]), mapping={
+                "brain_name": s["brain_name"],
+                "created_at": s["created_at"],
+                "nb_chunks": str(s["nb_chunks"]),
+                "files": s["files"],
+                "brain_id": s["brain_id"],
+                "owner_id": owner_id,
+            })
+            if s["files"]:
+                await rds.delete(K_FILES.format(sid=s["session_id"]))
+                await rds.sadd(K_FILES.format(sid=s["session_id"]), *s["files"].split("|"))
+        print(f"[OK] 从 Hologres 恢复 {len(sessions)} 个会话")
     print(f"[OK] Redis connected: {REDIS_HOST}:{REDIS_PORT}")
     print(f"[OK] Data dir: {DATA_DIR}")
     yield
@@ -187,7 +451,7 @@ class BrainRepo:
                 name=brain_name,
                 llm=llm,
                 storage=LocalStorage(UPLOADS_DIR / session_id),
-                brain_id=uuid.UUID(raw.get("brain_id", str(uuid.uuid4()))),
+                brain_id=_safe_brain_id(raw.get("brain_id")),
             )
             brain.vector_store = create_vector_store(embedder, session_id)
             self.put(session_id, brain)
@@ -203,7 +467,7 @@ class BrainRepo:
                 name=brain_name,
                 llm=llm,
                 storage=LocalStorage(UPLOADS_DIR / session_id),
-                brain_id=uuid.UUID(raw.get("brain_id", str(uuid.uuid4()))),
+                brain_id=_safe_brain_id(raw.get("brain_id")),
             )
             brain.vector_store = type("FAISSStore", (), {})()  # 占位，下面替换
             from myrag.vectorstore.faiss_store import FAISSStore
@@ -225,6 +489,20 @@ class BrainRepo:
 
 
 brain_repo = BrainRepo()
+
+
+def _safe_brain_id(raw_value: str | None) -> uuid.UUID | None:
+    """把 Redis/Hologres 里存的 brain_id 字符串解析成 UUID，失败时返回 None。
+
+    历史数据可能存的是空串 / 非 UUID 字面量（之前版本的 brain_id 默认值、
+    或者 Hologres 迁移时类型变化），直接 `uuid.UUID(...)` 会抛 ValueError 拖垮请求。
+    """
+    if not raw_value:
+        return None
+    try:
+        return uuid.UUID(raw_value)
+    except (ValueError, TypeError):
+        return None
 
 
 # ===== 辅助函数 =====
@@ -271,12 +549,23 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "redis": redis_status}
 
 
-@app.post("/sessions", response_model=SessionInfo, dependencies=[Depends(verify_api_key)])
-async def create_session(req: CreateSessionRequest) -> SessionInfo:
+@app.post("/sessions", response_model=SessionInfo)
+async def create_session(req: CreateSessionRequest, owner: OwnerIdentity = Depends(resolve_owner)) -> SessionInfo:
     """创建新会话。返回 session_id，后续接口都要传它。"""
     session_id = str(uuid.uuid4())
     rds = redis_client.client
     now = datetime.now(timezone.utc).isoformat()
+    record = {
+        "session_id": session_id,
+        "owner_id": owner.owner_id,
+        "brain_name": req.brain_name,
+        "created_at": now,
+        "nb_chunks": 0,
+        "files": "",
+        "brain_id": "",
+    }
+    if is_hologres_vector_store():
+        await hologres_sessions.upsert(record)
     async with rds.pipeline(transaction=True) as pipe:
         await pipe.hset(
             K_SESSION.format(sid=session_id),
@@ -285,6 +574,8 @@ async def create_session(req: CreateSessionRequest) -> SessionInfo:
                 "created_at": now,
                 "nb_chunks": 0,
                 "files": "",
+                "brain_id": "",
+                "owner_id": owner.owner_id,
             },
         )
         await pipe.execute()
@@ -297,12 +588,57 @@ async def create_session(req: CreateSessionRequest) -> SessionInfo:
     )
 
 
-@app.get("/sessions/{session_id}", response_model=SessionInfo, dependencies=[Depends(verify_api_key)])
-async def get_session(session_id: str) -> SessionInfo:
+@app.get("/sessions", response_model=list[SessionInfo])
+async def list_sessions(owner: OwnerIdentity = Depends(resolve_owner)) -> list[SessionInfo]:
+    """列出当前 owner 的会话：Hologres 为权威源，FAISS 模式下退化为扫描 Redis。"""
+    if is_hologres_vector_store():
+        rows = await hologres_sessions.list_all(owner.owner_id)
+        return [
+            SessionInfo(
+                session_id=row["session_id"],
+                brain_name=row["brain_name"],
+                nb_chunks=int(row["nb_chunks"]),
+                files=[f for f in (row["files"] or "").split("|") if f],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    # FAISS 模式：从 Redis 扫 myrag:session:* 哈希，仅返回 owner_id 匹配的
+    rds = redis_client.client
+    out: list[SessionInfo] = []
+    async for key in rds.scan_iter(match="myrag:session:*"):
+        if ":files" in key or ":history" in key:
+            continue
+        sid = key.split(":", 2)[2] if key.count(":") >= 2 else None
+        if not sid:
+            continue
+        raw = await rds.hgetall(key)
+        if not raw:
+            continue
+        if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+            continue
+        out.append(
+            SessionInfo(
+                session_id=sid,
+                brain_name=raw.get("brain_name", ""),
+                nb_chunks=int(raw.get("nb_chunks", 0)),
+                files=[f for f in raw.get("files", "").split("|") if f],
+                created_at=raw.get("created_at", ""),
+            )
+        )
+    out.sort(key=lambda s: s.created_at, reverse=True)
+    return out
+
+
+@app.get("/sessions/{session_id}", response_model=SessionInfo)
+async def get_session_meta(session_id: str, owner: OwnerIdentity = Depends(resolve_owner)) -> SessionInfo:
     rds = redis_client.client
     raw = await rds.hgetall(K_SESSION.format(sid=session_id))
     if not raw:
         raise HTTPException(404, f"session {session_id} 不存在")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权访问此会话")
     files = [f for f in raw.get("files", "").split("|") if f]
     return SessionInfo(
         session_id=session_id,
@@ -313,9 +649,14 @@ async def get_session(session_id: str) -> SessionInfo:
     )
 
 
-@app.delete("/sessions/{session_id}", dependencies=[Depends(verify_api_key)])
-async def delete_session(session_id: str) -> dict[str, str]:
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, owner: OwnerIdentity = Depends(resolve_owner)) -> dict[str, str]:
     rds = redis_client.client
+    raw = await rds.hgetall(K_SESSION.format(sid=session_id))
+    if not raw:
+        raise HTTPException(404, f"session {session_id} 不存在")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权删除此会话")
     async with rds.pipeline(transaction=True) as pipe:
         await pipe.delete(K_SESSION.format(sid=session_id))
         await pipe.delete(K_FILES.format(sid=session_id))
@@ -334,19 +675,37 @@ async def delete_session(session_id: str) -> dict[str, str]:
         vector_store = create_vector_store(embedder, session_id)
         if hasattr(vector_store, "delete_tenant"):
             await vector_store.delete_tenant()
+        await hologres_sessions.delete(session_id, owner.owner_id)
     return {"deleted": session_id}
 
 
-@app.post("/upload", dependencies=[Depends(verify_api_key)])
+@app.get("/sessions/{session_id}/history")
+async def get_history(session_id: str, owner: OwnerIdentity = Depends(resolve_owner)) -> dict[str, Any]:
+    """返回聊天历史，便于前端刷新后恢复对话气泡。"""
+    rds = redis_client.client
+    raw = await rds.hgetall(K_SESSION.format(sid=session_id))
+    if not raw:
+        raise HTTPException(404, "session 不存在")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权访问此会话")
+    history = await _get_history(session_id)
+    return {"session_id": session_id, "history": history}
+
+
+@app.post("/upload")
 async def upload(
     session_id: str,
     files: list[UploadFile] = File(...),
+    owner: OwnerIdentity = Depends(resolve_owner),
 ) -> dict[str, Any]:
     """上传文档到指定 session。第一个文件上传时创建 Brain。"""
     rds = redis_client.client
     session_key = K_SESSION.format(sid=session_id)
-    if not await rds.exists(session_key):
+    raw = await rds.hgetall(session_key)
+    if not raw:
         raise HTTPException(404, f"session {session_id} 不存在，请先调用 session 初始化")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权访问此会话")
 
     if not files:
         raise HTTPException(400, "至少上传一个文件")
@@ -369,7 +728,6 @@ async def upload(
     # 2. 重建/获取 Brain
     llm = LLMEndpoint.from_env()
     embedder = DashScopeEmbedder.from_env()
-    raw = await rds.hgetall(session_key)
     brain_name = raw.get("brain_name", "MyRAG Brain")
     brain = await brain_repo.load_or_create(session_id, brain_name, llm, embedder)
 
@@ -395,6 +753,7 @@ async def upload(
     # 4. 写 Redis 元信息
     old_files = await rds.smembers(K_FILES.format(sid=session_id))
     new_filenames = [f.filename for f in files]
+    files_combined = "|".join(sorted(old_files | set(new_filenames)))
     async with rds.pipeline(transaction=True) as pipe:
         if new_filenames:
             await pipe.sadd(K_FILES.format(sid=session_id), *new_filenames)
@@ -402,11 +761,21 @@ async def upload(
             session_key,
             mapping={
                 "nb_chunks": str(len(brain.knowledge)),
-                "files": "|".join(sorted(old_files | set(new_filenames))),
+                "files": files_combined,
                 "brain_id": str(brain.id),
             },
         )
         await pipe.execute()
+    if is_hologres_vector_store():
+        await hologres_sessions.upsert({
+            "session_id": session_id,
+            "owner_id": owner.owner_id,
+            "brain_name": brain_name,
+            "created_at": raw.get("created_at") or datetime.now(timezone.utc).isoformat(),
+            "nb_chunks": len(brain.knowledge),
+            "files": files_combined,
+            "brain_id": str(brain.id),
+        })
 
     return {
         "uploaded": new_filenames,
@@ -415,15 +784,18 @@ async def upload(
     }
 
 
-@app.post("/ask", response_model=AskResponse, dependencies=[Depends(verify_api_key)])
-async def ask(req: AskRequest) -> AskResponse:
+@app.post("/ask", response_model=AskResponse)
+async def ask(req: AskRequest, owner: OwnerIdentity = Depends(resolve_owner)) -> AskResponse:
     """同步问答（带 session 历史）。"""
     rds = redis_client.client
-    if not await rds.exists(K_SESSION.format(sid=req.session_id)):
+    raw = await rds.hgetall(K_SESSION.format(sid=req.session_id))
+    if not raw:
         raise HTTPException(404, "session 不存在")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权访问此会话")
     brain = brain_repo.get(req.session_id) or await brain_repo.load_or_create(
         req.session_id,
-        (await rds.hget(K_SESSION.format(sid=req.session_id), "brain_name")) or "MyRAG Brain",
+        raw.get("brain_name", "MyRAG Brain"),
         LLMEndpoint.from_env(),
         DashScopeEmbedder.from_env(),
     )
@@ -434,8 +806,12 @@ async def ask(req: AskRequest) -> AskResponse:
     return AskResponse(answer=answer, session_id=req.session_id)
 
 
-@app.get("/sessions/{session_id}/suggested-questions", response_model=SuggestedQuestionsResponse, dependencies=[Depends(verify_api_key)])
-async def suggested_questions(session_id: str, count: int = 5) -> SuggestedQuestionsResponse:
+@app.get("/sessions/{session_id}/suggested-questions", response_model=SuggestedQuestionsResponse)
+async def suggested_questions(
+    session_id: str,
+    count: int = 5,
+    owner: OwnerIdentity = Depends(resolve_owner),
+) -> SuggestedQuestionsResponse:
     """基于当前 session 的文档生成可点击的问题。"""
     if count < 1 or count > 10:
         raise HTTPException(400, "count 必须在 1 到 10 之间")
@@ -444,6 +820,8 @@ async def suggested_questions(session_id: str, count: int = 5) -> SuggestedQuest
     raw = await rds.hgetall(session_key)
     if not raw:
         raise HTTPException(404, "session 不存在")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权访问此会话")
     if int(raw.get("nb_chunks", 0)) <= 0:
         return SuggestedQuestionsResponse(session_id=session_id, questions=[])
     brain = brain_repo.get(session_id) or await brain_repo.load_or_create(
@@ -456,15 +834,18 @@ async def suggested_questions(session_id: str, count: int = 5) -> SuggestedQuest
     return SuggestedQuestionsResponse(session_id=session_id, questions=questions)
 
 
-@app.post("/ask_stream", dependencies=[Depends(verify_api_key)])
-async def ask_stream(req: AskRequest):
+@app.post("/ask_stream")
+async def ask_stream(req: AskRequest, owner: OwnerIdentity = Depends(resolve_owner)):
     """SSE 流式问答。"""
     rds = redis_client.client
-    if not await rds.exists(K_SESSION.format(sid=req.session_id)):
+    raw = await rds.hgetall(K_SESSION.format(sid=req.session_id))
+    if not raw:
         raise HTTPException(404, "session 不存在")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权访问此会话")
     brain = brain_repo.get(req.session_id) or await brain_repo.load_or_create(
         req.session_id,
-        (await rds.hget(K_SESSION.format(sid=req.session_id), "brain_name")) or "MyRAG Brain",
+        raw.get("brain_name", "MyRAG Brain"),
         LLMEndpoint.from_env(),
         DashScopeEmbedder.from_env(),
     )

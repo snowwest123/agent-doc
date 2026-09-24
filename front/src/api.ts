@@ -19,6 +19,21 @@ export async function createSession(brainName: string): Promise<SessionInfo> {
   return r.json()
 }
 
+export async function listSessions(): Promise<SessionInfo[]> {
+  const r = await fetch(`${BASE}/sessions`, { headers: headers() })
+  if (!r.ok) throw new Error(`listSessions ${r.status}`)
+  return r.json()
+}
+
+export async function getHistory(
+  sid: string,
+): Promise<{ role: 'user' | 'assistant'; content: string }[]> {
+  const r = await fetch(`${BASE}/sessions/${sid}/history`, { headers: headers() })
+  if (!r.ok) throw new Error(`getHistory ${r.status}`)
+  const data: { history: { role: 'user' | 'assistant'; content: string }[] } = await r.json()
+  return data.history || []
+}
+
 export async function getSession(sid: string): Promise<SessionInfo> {
   const r = await fetch(`${BASE}/sessions/${sid}`, { headers: headers() })
   if (!r.ok) throw new Error(`getSession ${r.status}`)

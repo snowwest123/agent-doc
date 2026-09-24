@@ -7,14 +7,16 @@ import { Button, Input, Modal } from 'antd';
 import {
   createSession,
   deleteSession as apiDeleteSession,
+  getHistory,
   getSession,
   healthCheck,
+  listSessions,
 } from './api';
 import type { Message, SessionInfo } from './types';
 import { useStream } from './hooks/useStream';
 import testDocUrl from './components/assistant_test_doc.txt?url';
 
-const SESSIONS_KEY = 'myrag_sessions';
+const CURRENT_SID_KEY = 'myrag_current_sid';
 
 export default function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -28,13 +30,26 @@ export default function App() {
   const [creating, setCreating] = useState(false);
   const { streaming, start, stop } = useStream();
 
-  useEffect(() => {
-    const raw = localStorage.getItem(SESSIONS_KEY);
-    if (raw) {
-      const list: SessionInfo[] = JSON.parse(raw);
+  // 从后端拉全量会话（Hologres 持久化），刷新也不会丢
+  const refreshSessions = useCallback(async () => {
+    try {
+      const list = await listSessions();
       setSessions(list);
-      if (list.length > 0) setCurrentSid(list[0].session_id);
+      const saved = localStorage.getItem(CURRENT_SID_KEY);
+      if (saved && list.some((s) => s.session_id === saved)) {
+        setCurrentSid(saved);
+      } else if (list.length > 0) {
+        setCurrentSid(list[0].session_id);
+      } else {
+        setCurrentSid(null);
+      }
+    } catch (err) {
+      console.error('listSessions failed', err);
     }
+  }, []);
+
+  useEffect(() => {
+    refreshSessions();
     const tick = async () => {
       try {
         const h = await healthCheck();
@@ -46,21 +61,44 @@ export default function App() {
     tick();
     const t = setInterval(tick, 10000);
     return () => clearInterval(t);
-  }, []);
+  }, [refreshSessions]);
 
+  // 切换 / 初次加载 currentSid 时：拉脑信息 + 聊天历史
   useEffect(() => {
-    if (!currentSid) return;
+    if (!currentSid) {
+      setBrainInfo(null);
+      setMessages([]);
+      setSuggestedQuestions([]);
+      return;
+    }
+    localStorage.setItem(CURRENT_SID_KEY, currentSid);
+    let cancelled = false;
     getSession(currentSid)
-      .then(setBrainInfo)
-      .catch(() => setBrainInfo(null));
-    setMessages([]);
+      .then((info) => {
+        if (!cancelled) setBrainInfo(info);
+      })
+      .catch(() => {
+        if (!cancelled) setBrainInfo(null);
+      });
+    getHistory(currentSid)
+      .then((history) => {
+        if (cancelled) return;
+        setMessages(
+          history.map((m, idx) => ({
+            id: `r-${currentSid}-${idx}`,
+            role: m.role,
+            content: m.content,
+          })),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setMessages([]);
+      });
     setSuggestedQuestions([]);
+    return () => {
+      cancelled = true;
+    };
   }, [currentSid]);
-
-  const persistSessions = (list: SessionInfo[]) => {
-    setSessions(list);
-    localStorage.setItem(SESSIONS_KEY, JSON.stringify(list));
-  };
 
   const handleCreate = () => {
     setBrainName('MyRAG Brain');
@@ -73,7 +111,7 @@ export default function App() {
     setCreating(true);
     try {
       const s = await createSession(name);
-      persistSessions([s, ...sessions]);
+      setSessions((prev) => [s, ...prev.filter((x) => x.session_id !== s.session_id)]);
       setCurrentSid(s.session_id);
       setCreateModalOpen(false);
     } finally {
@@ -83,8 +121,12 @@ export default function App() {
 
   const handleDelete = async (sid: string) => {
     await apiDeleteSession(sid);
-    persistSessions(sessions.filter((s) => s.session_id !== sid));
-    if (currentSid === sid) setCurrentSid(null);
+    setSessions((prev) => prev.filter((s) => s.session_id !== sid));
+    if (currentSid === sid) {
+      setCurrentSid(null);
+      setMessages([]);
+      setBrainInfo(null);
+    }
   };
 
   const handleUploaded = async (questions: string[]) => {
@@ -92,8 +134,8 @@ export default function App() {
     const info = await getSession(currentSid);
     setBrainInfo(info);
     setSuggestedQuestions(questions);
-    persistSessions(
-      sessions.map((s) => (s.session_id === currentSid ? info : s)),
+    setSessions((prev) =>
+      prev.map((s) => (s.session_id === currentSid ? info : s)),
     );
   };
 
