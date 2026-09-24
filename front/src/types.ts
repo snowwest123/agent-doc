@@ -1,9 +1,13 @@
+// 会话工作模式：knowledge=文档问答 / database=查业务数据
+export type SessionMode = 'knowledge' | 'database'
+
 export interface SessionInfo {
   session_id: string
   brain_name: string
   nb_chunks: number
   files: string[]
   created_at: string
+  mode: SessionMode
 }
 
 export interface Message {

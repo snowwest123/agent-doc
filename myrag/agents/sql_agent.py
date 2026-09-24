@@ -144,108 +144,114 @@ class TextToSQLAgent:
         )
 
     async def run(self, question: str, db_path: str) -> AgentResult:
-        """运行 Agent。"""
-        system_prompt = self._build_system_prompt(db_path)
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=question),
-        ]
+        """运行 Agent，并兼容原有的一次性返回接口。"""
+        result: AgentResult | None = None
+        async for event in self.astream_events(question, db_path):
+            if event.get("type") == "done":
+                result = AgentResult(
+                    answer=event["answer"],
+                    steps=[AgentStep(**step) for step in event["steps"]],
+                    success=event["success"],
+                )
+        return result or AgentResult(answer="Agent 未能完成任务", success=False)
 
+    async def astream_events(self, question: str, db_path: str):
+        """流式返回 Agent 的工具调用、工具结果和最终答案事件。"""
+        system_prompt = self._build_system_prompt(db_path)
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content=question)]
         steps: list[AgentStep] = []
         final_answer = None
-        attempted: list[dict] = []  # 记录失败的尝试，避免重复
+        attempted: list[dict] = []
+        yield {"type": "agent_start", "question": question}
 
         for i in range(self.max_iterations):
-            # 1. 让 LLM 决定下一步
-            response = await self.llm.ainvoke(messages)
-            response_text = response.strip()
-
-            # 2. 解析 JSON 决策
+            yield {"type": "llm_start", "step": i + 1, "message": "正在分析下一步 Agent 动作"}
+            response_text = (await self.llm.ainvoke(messages)).strip()
             decision = self._parse_decision(response_text)
+            yield {"type": "llm_decision", "step": i + 1, "action": decision.get("action") if decision else "final_answer"}
             if not decision:
-                # LLM 没按格式输出，强行当 final_answer
                 final_answer = response_text
-                steps.append(AgentStep(
-                    step=i+1,
-                    action="final_answer",
-                    final_answer=response_text,
-                ))
+                step = AgentStep(step=i + 1, action="final_answer", final_answer=response_text)
+                steps.append(step)
+                yield {"type": "final_answer", "answer": final_answer, "step": i + 1}
                 break
 
             action = decision.get("action")
-
             if action == "final_answer":
                 final_answer = decision.get("answer", "")
-                steps.append(AgentStep(
-                    step=i+1,
+                step = AgentStep(
+                    step=i + 1,
                     action="final_answer",
                     final_answer=final_answer,
                     reasoning=decision.get("reasoning", ""),
-                ))
+                )
+                steps.append(step)
+                yield {"type": "final_answer", "answer": final_answer, "step": i + 1}
                 break
 
-            if action == "tool_call":
-                tool_name = decision.get("tool")
-                tool_args = decision.get("args", {})
-                # 自动注入 db_path（如果工具需要）
-                if "db_path" not in tool_args:
-                    tool_args["db_path"] = db_path
+            if action != "tool_call":
+                continue
 
-                # 3. 执行工具
-                wrapper = self.tool_registry.get(tool_name)
-                if not wrapper:
-                    tool_result = f"【未知工具】{tool_name} 不存在。可用工具：{self.tool_registry.list_tools()}"
-                    attempted.append({
-                        "tool": tool_name,
-                        "args": tool_args,
-                        "error": tool_result,
-                    })
-                else:
-                    try:
-                        raw_result = await wrapper.tool.ainvoke(tool_args)
-                        tool_result = wrapper.format_output(raw_result)
-                    except Exception as e:
-                        # 【核心改进】错误分类
-                        tool_result = _classify_error(e)
-                        attempted.append({
-                            "tool": tool_name,
-                            "args": tool_args,
-                            "error": tool_result[:200],  # 只存前 200 字符
-                        })
+            tool_name = decision.get("tool")
+            tool_args = decision.get("args", {})
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+            wrapper = self.tool_registry.get(tool_name)
+            args_schema = getattr(getattr(wrapper, "tool", None), "args_schema", None)
+            fields = getattr(args_schema, "model_fields", None) if args_schema else None
+            if fields is None:
+                fields = getattr(args_schema, "__fields__", {}) if args_schema else {}
+            if "db_path" in fields and "db_path" not in tool_args:
+                tool_args["db_path"] = db_path
 
-                steps.append(AgentStep(
-                    step=i+1,
-                    action="tool_call",
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    tool_result=tool_result,
-                    reasoning=decision.get("reasoning", ""),
-                ))
+            yield {
+                "type": "tool_call",
+                "step": i + 1,
+                "tool": tool_name,
+                "args": tool_args,
+                "reasoning": decision.get("reasoning", ""),
+            }
+            if not wrapper:
+                tool_result = f"【未知工具】{tool_name} 不存在。可用工具：{self.tool_registry.list_tools()}"
+                attempted.append({"tool": tool_name, "args": tool_args, "error": tool_result})
+            else:
+                try:
+                    raw_result = await wrapper.tool.ainvoke(tool_args)
+                    tool_result = wrapper.format_output(raw_result)
+                except Exception as e:
+                    tool_result = _classify_error(e)
+                    attempted.append({"tool": tool_name, "args": tool_args, "error": tool_result[:200]})
 
-                # 4. 把工具结果喂回 messages
-                messages.append(SystemMessage(
-                    content=f"工具 {tool_name} 返回：\n{tool_result}"
-                ))
+            step = AgentStep(
+                step=i + 1,
+                action="tool_call",
+                tool_name=tool_name,
+                tool_args=tool_args,
+                tool_result=tool_result,
+                reasoning=decision.get("reasoning", ""),
+            )
+            steps.append(step)
+            yield {"type": "tool_result", "step": i + 1, "tool": tool_name, "result": tool_result}
+            messages.append(SystemMessage(content=f"工具 {tool_name} 返回：\n{tool_result}"))
+            messages[0] = SystemMessage(content=self._build_system_prompt(db_path, attempted))
 
-                # 5. 重新生成 system_prompt（加入 attempted 列表）
-                # 这样 LLM 在下次决策时能看到"已失败的尝试"
-                messages[0] = SystemMessage(content=self._build_system_prompt(db_path, attempted))
-
-        # 如果没拿到 final_answer，就把最后一轮工具结果当答案
         if not final_answer:
             last_step = steps[-1] if steps else None
             if last_step and last_step.tool_result and "【错误】" not in last_step.tool_result and "【" not in last_step.tool_result:
-                # 再调一次 LLM 让它总结
-                messages.append(HumanMessage(content="请基于工具结果回答用户问题。"))
-                final_answer = (await self.llm.ainvoke(messages)).strip()
+                messages.append(HumanMessage(content="请基于工具结果直接给出最终答案，不要再调用工具。"))
+                summary = (await self.llm.ainvoke(messages)).strip()
+                decision = self._parse_decision(summary)
+                final_answer = decision.get("answer", "") if decision and decision.get("action") == "final_answer" else summary
             else:
                 final_answer = "Agent 未能完成任务（可能因为重复的工具错误）"
+            yield {"type": "final_answer", "answer": final_answer, "step": len(steps) + 1}
 
-        return AgentResult(
-            answer=final_answer,
-            steps=steps,
-            success=bool(final_answer) and "未能" not in final_answer,
-        )
+        yield {
+            "type": "done",
+            "answer": final_answer,
+            "success": bool(final_answer) and "未能" not in final_answer,
+            "steps": [step.__dict__ for step in steps],
+        }
 
     @staticmethod
     def _parse_decision(text: str) -> dict | None:

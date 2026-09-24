@@ -1,23 +1,31 @@
 """FastAPI 暴露 myrag Brain 作为 REST API。
 
 端点：
-  POST /sessions          创建会话
-  GET  /sessions          会话列表（持久化于 Hologres / Redis）
-  POST /upload            上传文档（绑定到 session）
-  POST /ask               同步问答
-  POST /ask_stream        SSE 流式问答
-  GET  /info              Brain 状态
-  GET  /sessions/{sid}    会话信息
-  GET  /sessions/{sid}/history   聊天历史
-  DELETE /sessions/{sid}  删会话
-  GET  /health            健康检查
+  POST /sessions                       创建会话（支持 mode=knowledge/database/auto）
+  GET  /sessions                       会话列表（持久化于 Hologres / Redis）
+  POST /sessions/{sid}/mode            切换会话工作模式
+  POST /upload                         上传文档（绑定到 session）
+  POST /ask                            同步问答（knowledge 模式）
+  POST /ask_sql                        Text-to-SQL 问答（database 模式）
+  POST /ask_sql_stream                  Text-to-SQL Agent 过程 SSE 流式问答
+  POST /ask_auto                       自动路由文档问答或数据库查询
+  POST /ask_stream                     SSE 流式问答（knowledge 模式）
+  GET  /info                           Brain 状态
+  GET  /sessions/{sid}                 会话信息
+  GET  /sessions/{sid}/history         聊天历史
+  DELETE /sessions/{sid}               删会话
+  GET  /health                         健康检查
 
 架构：
-  - Hologres：会话元数据（session_id / brain_name / created_at / nb_chunks / files / brain_id）
-              永久存储，Redis 重启 / 服务重启后自动恢复。
+  - Hologres：会话元数据（session_id / brain_name / created_at / nb_chunks /
+              files / brain_id / owner_id / mode），永久存储。
   - Redis：运行时缓存（启动时从 Hologres 恢复）+ 聊天历史 + 文件名 set。
   - volume (/app/data)：存原始上传文件；FAISS 模式下也保存本地索引。
   - 每个 session_id 独立一个 Brain，多租户隔离。
+  - mode 字段决定执行路径：
+        knowledge  → 现有 Brain RAG 链路（/ask、/ask_stream）
+        database   → Text-to-SQL Agent（/ask_sql）
+        auto       → LLM 意图路由（/ask_auto）
 """
 from __future__ import annotations
 
@@ -37,12 +45,16 @@ import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
+from myrag.agents.sql_agent import TextToSQLAgent
 from myrag.brain import Brain
 from myrag.embedding.dashscope_embedder import DashScopeEmbedder
 from myrag.llm import LLMEndpoint
 from myrag.processor.registry import ProcessorRegistry
+from myrag.tools.base import ToolRegistry
+from myrag.tools.sql_tool import create_hologres_tools
 from myrag.vectorstore.factory import create_vector_store, is_hologres_vector_store
 
 # ===== 路径 / 持久化常量 =====
@@ -56,12 +68,17 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 
 # session 在 Redis 里的 key 前缀
-K_SESSION = "myrag:session:{sid}"   # hash：brain_name / created_at / nb_chunks / files / brain_id / owner_id
+K_SESSION = "myrag:session:{sid}"   # hash：brain_name / created_at / nb_chunks / files / brain_id / owner_id / mode
 K_FILES = "myrag:session:{sid}:files"  # set：上传过的文件名
 K_HISTORY = "myrag:session:{sid}:history"  # list：聊天历史（JSON 序列化）
 
 # 当请求没带 API Key 且后端也没配置 MY_API_KEY 时使用此共享 owner（向后兼容单租户场景）。
 SHARED_OWNER = "__shared__"
+
+# 会话工作模式：knowledge=文档问答(database=查业务数据 / auto=LLM 自动路由)
+# RAG 与 Text-to-SQL 的关键分离点：不同 mode 走不同执行路径，避免一个 Brain 同时承担两种能力导致 prompt 污染。
+SESSION_MODES = ("knowledge", "database", "auto")
+DEFAULT_MODE = "knowledge"
 
 
 # ===== Hologres 会话元数据表（永久存储）=====
@@ -131,6 +148,14 @@ class HologresSessionStore:
                 f"UPDATE {self.table} SET owner_id = '__shared__' "
                 f"WHERE owner_id IS NULL"
             )
+            # mode 字段：标识会话使用哪种能力（knowledge/database/auto），老行默认 'knowledge'。
+            self._safe_alter(cur, conn,
+                f"ALTER TABLE {self.table} "
+                f"ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'knowledge'"
+            )
+            self._safe_alter(cur, conn,
+                f"UPDATE {self.table} SET mode = 'knowledge' WHERE mode IS NULL"
+            )
             self._safe_alter(cur, conn,
                 f"CREATE INDEX IF NOT EXISTS {self.table}_owner_idx "
                 f"ON {self.table}(owner_id)"
@@ -158,14 +183,15 @@ class HologresSessionStore:
             cur.execute(
                 f"""
                 INSERT INTO {self.table}
-                    (session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id, mode)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (session_id) DO UPDATE SET
                     owner_id   = EXCLUDED.owner_id,
                     brain_name = EXCLUDED.brain_name,
                     nb_chunks  = EXCLUDED.nb_chunks,
                     files      = EXCLUDED.files,
-                    brain_id   = COALESCE(EXCLUDED.brain_id, {self.table}.brain_id)
+                    brain_id   = COALESCE(EXCLUDED.brain_id, {self.table}.brain_id),
+                    mode       = EXCLUDED.mode
                 """,
                 (
                     data["session_id"],
@@ -175,6 +201,7 @@ class HologresSessionStore:
                     int(data.get("nb_chunks", 0)),
                     data.get("files", "") or "",
                     data.get("brain_id") or None,
+                    data.get("mode") or "knowledge",
                 ),
             )
             conn.commit()
@@ -202,7 +229,7 @@ class HologresSessionStore:
             if owner_id is None:
                 cur.execute(
                     f"""
-                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id
+                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id, mode
                     FROM {self.table}
                     ORDER BY created_at DESC
                     """
@@ -210,7 +237,7 @@ class HologresSessionStore:
             else:
                 cur.execute(
                     f"""
-                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id
+                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id, mode
                     FROM {self.table}
                     WHERE owner_id = %s
                     ORDER BY created_at DESC
@@ -220,7 +247,7 @@ class HologresSessionStore:
             rows = cur.fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
-            session_id, owner, brain_name, created_at, nb_chunks, files, brain_id = row
+            session_id, owner, brain_name, created_at, nb_chunks, files, brain_id, mode = row
             result.append(
                 {
                     "session_id": session_id,
@@ -230,6 +257,7 @@ class HologresSessionStore:
                     "nb_chunks": int(nb_chunks or 0),
                     "files": files or "",
                     "brain_id": brain_id or "",
+                    "mode": mode or "knowledge",
                 }
             )
         return result
@@ -242,7 +270,7 @@ class HologresSessionStore:
             if owner_id is None:
                 cur.execute(
                     f"""
-                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id
+                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id, mode
                     FROM {self.table} WHERE session_id = %s
                     """,
                     (session_id,),
@@ -250,7 +278,7 @@ class HologresSessionStore:
             else:
                 cur.execute(
                     f"""
-                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id
+                    SELECT session_id, owner_id, brain_name, created_at, nb_chunks, files, brain_id, mode
                     FROM {self.table}
                     WHERE session_id = %s AND owner_id = %s
                     """,
@@ -259,7 +287,7 @@ class HologresSessionStore:
             row = cur.fetchone()
         if not row:
             return None
-        sid, owner, brain_name, created_at, nb_chunks, files, brain_id = row
+        sid, owner, brain_name, created_at, nb_chunks, files, brain_id, mode = row
         return {
             "session_id": sid,
             "owner_id": owner or "__shared__",
@@ -268,6 +296,7 @@ class HologresSessionStore:
             "nb_chunks": int(nb_chunks or 0),
             "files": files or "",
             "brain_id": brain_id or "",
+            "mode": mode or "knowledge",
         }
 
     async def get_one(self, session_id: str, owner_id: str | None = None) -> dict[str, Any] | None:
@@ -349,6 +378,7 @@ async def lifespan(app: FastAPI):
         rds = redis_client.client
         for s in sessions:
             owner_id = s.get("owner_id") or SHARED_OWNER
+            mode = s.get("mode") or DEFAULT_MODE
             await rds.hset(K_SESSION.format(sid=s["session_id"]), mapping={
                 "brain_name": s["brain_name"],
                 "created_at": s["created_at"],
@@ -356,6 +386,7 @@ async def lifespan(app: FastAPI):
                 "files": s["files"],
                 "brain_id": s["brain_id"],
                 "owner_id": owner_id,
+                "mode": mode,
             })
             if s["files"]:
                 await rds.delete(K_FILES.format(sid=s["session_id"]))
@@ -389,9 +420,14 @@ class SessionInfo(BaseModel):
     nb_chunks: int
     files: list[str]
     created_at: str
+    mode: str = DEFAULT_MODE  # knowledge / database / auto
 
 class CreateSessionRequest(BaseModel):
     brain_name: str = "MyRAG Brain"
+    mode: str = DEFAULT_MODE  # 创建时就指定会话工作模式，后续可切换
+
+class SetModeRequest(BaseModel):
+    mode: str
 
 class AskRequest(BaseModel):
     question: str
@@ -401,6 +437,16 @@ class AskRequest(BaseModel):
 class AskResponse(BaseModel):
     answer: str
     session_id: str
+
+class AskSqlResponse(BaseModel):
+    answer: str
+    session_id: str
+    sql_steps: list[dict[str, Any]] = []
+
+class AskAutoResponse(BaseModel):
+    answer: str
+    session_id: str
+    route: str
 
 class SuggestedQuestionsResponse(BaseModel):
     session_id: str
@@ -491,6 +537,85 @@ class BrainRepo:
 brain_repo = BrainRepo()
 
 
+class HologresAgent(TextToSQLAgent):
+    """面向 Hologres 的 Text-to-SQL Agent。"""
+
+    def _build_system_prompt(self, db_path: str, attempted: list | None = None) -> str:
+        attempted_note = ""
+        if attempted:
+            attempted_note = (
+                "\n\n以下尝试已经失败，不要重复：\n"
+                + "\n".join(
+                    f"- {a['tool']}({a['args']}) -> {a['error']}"
+                    for a in attempted[-3:]
+                )
+            )
+        return (
+            "你是一个 SQL 数据分析助手，可以调用阿里云 Hologres 工具。\n\n"
+            "可用工具：\n"
+            "- get_hologres_schema：查看所有表结构\n"
+            "- hologres_query：执行 SELECT 查询，参数名为 query\n\n"
+            "工作流程：先查看 schema，再执行查询，最后用自然语言回答。\n"
+            f"{attempted_note}\n\n"
+            "调工具时只输出 JSON："
+            '{"action":"tool_call","tool":"工具名","args":{},"reasoning":"..."}\n'
+            "最终回答时只输出 JSON："
+            '{"action":"final_answer","answer":"...","reasoning":"..."}'
+        )
+
+
+_sql_agent: HologresAgent | None = None
+_auto_router_llm: LLMEndpoint | None = None
+
+
+def _get_sql_agent() -> HologresAgent:
+    """懒加载无状态 SQL Agent，避免服务启动时强依赖数据库连接。"""
+    global _sql_agent
+    if _sql_agent is None:
+        registry = ToolRegistry()
+        schema_tool, query_tool = create_hologres_tools()
+        registry.register("get_hologres_schema", schema_tool)
+        registry.register("hologres_query", query_tool)
+        _sql_agent = HologresAgent(
+            llm=LLMEndpoint.from_env(),
+            tool_registry=registry,
+            max_iterations=5,
+        )
+    return _sql_agent
+
+
+def _get_auto_router_llm() -> LLMEndpoint:
+    global _auto_router_llm
+    if _auto_router_llm is None:
+        _auto_router_llm = LLMEndpoint.from_env()
+    return _auto_router_llm
+
+
+async def _route_auto(question: str, has_documents: bool) -> str:
+    """让 LLM 判断问题应该走文档检索还是数据库查询。"""
+    messages = [
+        SystemMessage(content=(
+            "你是 MyRAG 的意图路由器。只能在 knowledge 和 database 中二选一。\n"
+            "knowledge：问题询问已上传文档、规则、说明、方案或文本内容。\n"
+            "database：问题询问业务表、客户、订单、销售额、统计、排名或数量。\n"
+            f"当前会话是否有文档：{'是' if has_documents else '否'}。\n"
+            "只输出 JSON，不要解释："
+            '{"route":"knowledge"} 或 {"route":"database"}'
+        )),
+        HumanMessage(content=question),
+    ]
+    text = await _get_auto_router_llm().ainvoke(messages)
+    match = re.search(r"\{.*?\}", text, re.DOTALL)
+    if match:
+        try:
+            route = json.loads(match.group()).get("route")
+            if route in {"knowledge", "database"}:
+                return route
+        except json.JSONDecodeError:
+            pass
+    return "knowledge" if has_documents else "database"
+
+
 def _safe_brain_id(raw_value: str | None) -> uuid.UUID | None:
     """把 Redis/Hologres 里存的 brain_id 字符串解析成 UUID，失败时返回 None。
 
@@ -552,6 +677,8 @@ async def health() -> dict[str, str]:
 @app.post("/sessions", response_model=SessionInfo)
 async def create_session(req: CreateSessionRequest, owner: OwnerIdentity = Depends(resolve_owner)) -> SessionInfo:
     """创建新会话。返回 session_id，后续接口都要传它。"""
+    if req.mode not in SESSION_MODES:
+        raise HTTPException(400, f"mode 必须是 {SESSION_MODES} 之一")
     session_id = str(uuid.uuid4())
     rds = redis_client.client
     now = datetime.now(timezone.utc).isoformat()
@@ -563,6 +690,7 @@ async def create_session(req: CreateSessionRequest, owner: OwnerIdentity = Depen
         "nb_chunks": 0,
         "files": "",
         "brain_id": "",
+        "mode": req.mode,
     }
     if is_hologres_vector_store():
         await hologres_sessions.upsert(record)
@@ -576,6 +704,7 @@ async def create_session(req: CreateSessionRequest, owner: OwnerIdentity = Depen
                 "files": "",
                 "brain_id": "",
                 "owner_id": owner.owner_id,
+                "mode": req.mode,
             },
         )
         await pipe.execute()
@@ -585,6 +714,7 @@ async def create_session(req: CreateSessionRequest, owner: OwnerIdentity = Depen
         nb_chunks=0,
         files=[],
         created_at=now,
+        mode=req.mode,
     )
 
 
@@ -600,6 +730,7 @@ async def list_sessions(owner: OwnerIdentity = Depends(resolve_owner)) -> list[S
                 nb_chunks=int(row["nb_chunks"]),
                 files=[f for f in (row["files"] or "").split("|") if f],
                 created_at=row["created_at"],
+                mode=row.get("mode") or DEFAULT_MODE,
             )
             for row in rows
         ]
@@ -625,6 +756,7 @@ async def list_sessions(owner: OwnerIdentity = Depends(resolve_owner)) -> list[S
                 nb_chunks=int(raw.get("nb_chunks", 0)),
                 files=[f for f in raw.get("files", "").split("|") if f],
                 created_at=raw.get("created_at", ""),
+                mode=raw.get("mode") or DEFAULT_MODE,
             )
         )
     out.sort(key=lambda s: s.created_at, reverse=True)
@@ -646,6 +778,47 @@ async def get_session_meta(session_id: str, owner: OwnerIdentity = Depends(resol
         nb_chunks=int(raw.get("nb_chunks", 0)),
         files=files,
         created_at=raw.get("created_at", ""),
+        mode=raw.get("mode") or DEFAULT_MODE,
+    )
+
+
+@app.post("/sessions/{session_id}/mode", response_model=SessionInfo)
+async def set_session_mode(
+    session_id: str,
+    req: SetModeRequest,
+    owner: OwnerIdentity = Depends(resolve_owner),
+) -> SessionInfo:
+    """切换会话的工作模式：knowledge / database / auto。"""
+    if req.mode not in SESSION_MODES:
+        raise HTTPException(400, f"mode 必须是 {SESSION_MODES} 之一")
+    rds = redis_client.client
+    raw = await rds.hgetall(K_SESSION.format(sid=session_id))
+    if not raw:
+        raise HTTPException(404, f"session {session_id} 不存在")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权访问此会话")
+
+    await rds.hset(K_SESSION.format(sid=session_id), "mode", req.mode)
+    if is_hologres_vector_store():
+        # 同步写 Hologres：复用 upsert，保证重启后 mode 还在。
+        await hologres_sessions.upsert({
+            "session_id": session_id,
+            "owner_id": owner.owner_id,
+            "brain_name": raw.get("brain_name", "MyRAG Brain"),
+            "created_at": raw.get("created_at") or datetime.now(timezone.utc).isoformat(),
+            "nb_chunks": int(raw.get("nb_chunks", 0)),
+            "files": raw.get("files", ""),
+            "brain_id": raw.get("brain_id", ""),
+            "mode": req.mode,
+        })
+    files = [f for f in raw.get("files", "").split("|") if f]
+    return SessionInfo(
+        session_id=session_id,
+        brain_name=raw.get("brain_name", ""),
+        nb_chunks=int(raw.get("nb_chunks", 0)),
+        files=files,
+        created_at=raw.get("created_at", ""),
+        mode=req.mode,
     )
 
 
@@ -775,6 +948,7 @@ async def upload(
             "nb_chunks": len(brain.knowledge),
             "files": files_combined,
             "brain_id": str(brain.id),
+            "mode": raw.get("mode") or DEFAULT_MODE,
         })
 
     return {
@@ -786,13 +960,19 @@ async def upload(
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(req: AskRequest, owner: OwnerIdentity = Depends(resolve_owner)) -> AskResponse:
-    """同步问答（带 session 历史）。"""
+    """同步问答（带 session 历史）。只服务于 knowledge 模式。"""
     rds = redis_client.client
     raw = await rds.hgetall(K_SESSION.format(sid=req.session_id))
     if not raw:
         raise HTTPException(404, "session 不存在")
     if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
         raise HTTPException(403, "无权访问此会话")
+    session_mode = raw.get("mode") or DEFAULT_MODE
+    if session_mode != "knowledge":
+        raise HTTPException(
+            400,
+            f"当前会话 mode={session_mode}，请使用对应端点：/ask_sql 或 /ask_auto"
+        )
     brain = brain_repo.get(req.session_id) or await brain_repo.load_or_create(
         req.session_id,
         raw.get("brain_name", "MyRAG Brain"),
@@ -804,6 +984,96 @@ async def ask(req: AskRequest, owner: OwnerIdentity = Depends(resolve_owner)) ->
     await _append_history(req.session_id, "user", req.question)
     await _append_history(req.session_id, "assistant", answer)
     return AskResponse(answer=answer, session_id=req.session_id)
+
+
+@app.post("/ask_sql", response_model=AskSqlResponse)
+async def ask_sql(req: AskRequest, owner: OwnerIdentity = Depends(resolve_owner)) -> AskSqlResponse:
+    """使用 Hologres Text-to-SQL Agent 回答数据库问题。"""
+    rds = redis_client.client
+    raw = await rds.hgetall(K_SESSION.format(sid=req.session_id))
+    if not raw:
+        raise HTTPException(404, "session 不存在")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权访问此会话")
+    session_mode = raw.get("mode") or DEFAULT_MODE
+    if session_mode != "database":
+        raise HTTPException(400, f"当前会话 mode={session_mode}，请先切换到 database")
+
+    result = await _get_sql_agent().run(req.question, db_path="hologres")
+    await _append_history(req.session_id, "user", req.question)
+    await _append_history(req.session_id, "assistant", result.answer)
+    return AskSqlResponse(
+        answer=result.answer,
+        session_id=req.session_id,
+        sql_steps=[step.__dict__ for step in result.steps],
+    )
+
+
+@app.post("/ask_sql_stream")
+async def ask_sql_stream(req: AskRequest, owner: OwnerIdentity = Depends(resolve_owner)):
+    """以 SSE 返回 SQL Agent 的完整执行过程。"""
+    # #region debug-point E:server-entry
+    await asyncio.to_thread(__import__('urllib.request', fromlist=['Request']).urlopen, __import__('urllib.request', fromlist=['Request']).Request('http://127.0.0.1:7777/event', data=json.dumps({'sessionId': 'sql-agent-stream', 'runId': 'pre', 'hypothesisId': 'E', 'location': 'examples/step13_fastapi/main.py:ask_sql_stream', 'msg': '[DEBUG] ask_sql_stream entered', 'data': {'session_id': req.session_id, 'mode': 'database'}}).encode(), headers={'Content-Type': 'application/json'}))
+    # #endregion
+    rds = redis_client.client
+    raw = await rds.hgetall(K_SESSION.format(sid=req.session_id))
+    if not raw:
+        raise HTTPException(404, "session 不存在")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权访问此会话")
+    if (raw.get("mode") or DEFAULT_MODE) != "database":
+        raise HTTPException(400, "当前会话不是 database 模式")
+
+    async def event_generator():
+        try:
+            async for event in _get_sql_agent().astream_events(req.question, db_path="hologres"):
+                # #region debug-point C:server-event
+                await asyncio.to_thread(__import__('urllib.request', fromlist=['Request']).urlopen, __import__('urllib.request', fromlist=['Request']).Request('http://127.0.0.1:7777/event', data=json.dumps({'sessionId': 'sql-agent-stream', 'runId': 'pre', 'hypothesisId': 'C', 'location': 'examples/step13_fastapi/main.py:event_generator', 'msg': '[DEBUG] SSE event yielded', 'data': {'event_type': event.get('type')}}).encode(), headers={'Content-Type': 'application/json'}))
+                # #endregion
+                if event.get("type") == "done":
+                    await _append_history(req.session_id, "user", req.question)
+                    await _append_history(req.session_id, "assistant", event["answer"])
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/ask_auto", response_model=AskAutoResponse)
+async def ask_auto(req: AskRequest, owner: OwnerIdentity = Depends(resolve_owner)) -> AskAutoResponse:
+    """根据问题意图，在文档 RAG 与 Hologres SQL 之间自动路由。"""
+    rds = redis_client.client
+    raw = await rds.hgetall(K_SESSION.format(sid=req.session_id))
+    if not raw:
+        raise HTTPException(404, "session 不存在")
+    if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
+        raise HTTPException(403, "无权访问此会话")
+    if (raw.get("mode") or DEFAULT_MODE) != "auto":
+        raise HTTPException(400, "当前会话不是 auto 模式")
+
+    route = await _route_auto(req.question, int(raw.get("nb_chunks", 0)) > 0)
+    if route == "database":
+        result = await _get_sql_agent().run(req.question, db_path="hologres")
+        answer = result.answer
+    else:
+        brain = brain_repo.get(req.session_id) or await brain_repo.load_or_create(
+            req.session_id,
+            raw.get("brain_name", "MyRAG Brain"),
+            LLMEndpoint.from_env(),
+            DashScopeEmbedder.from_env(),
+        )
+        history = await _get_history(req.session_id) if req.use_history else []
+        answer = await brain.ask(req.question, chat_history=history)
+
+    await _append_history(req.session_id, "user", req.question)
+    await _append_history(req.session_id, "assistant", answer)
+    return AskAutoResponse(answer=answer, session_id=req.session_id, route=route)
 
 
 @app.get("/sessions/{session_id}/suggested-questions", response_model=SuggestedQuestionsResponse)
@@ -836,13 +1106,19 @@ async def suggested_questions(
 
 @app.post("/ask_stream")
 async def ask_stream(req: AskRequest, owner: OwnerIdentity = Depends(resolve_owner)):
-    """SSE 流式问答。"""
+    """SSE 流式问答。只服务于 knowledge 模式。"""
     rds = redis_client.client
     raw = await rds.hgetall(K_SESSION.format(sid=req.session_id))
     if not raw:
         raise HTTPException(404, "session 不存在")
     if (raw.get("owner_id") or SHARED_OWNER) != owner.owner_id:
         raise HTTPException(403, "无权访问此会话")
+    session_mode = raw.get("mode") or DEFAULT_MODE
+    if session_mode != "knowledge":
+        raise HTTPException(
+            400,
+            f"当前会话 mode={session_mode}，请使用对应端点：/ask_sql 或 /ask_auto"
+        )
     brain = brain_repo.get(req.session_id) or await brain_repo.load_or_create(
         req.session_id,
         raw.get("brain_name", "MyRAG Brain"),
