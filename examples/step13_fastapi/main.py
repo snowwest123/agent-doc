@@ -1012,9 +1012,6 @@ async def ask_sql(req: AskRequest, owner: OwnerIdentity = Depends(resolve_owner)
 @app.post("/ask_sql_stream")
 async def ask_sql_stream(req: AskRequest, owner: OwnerIdentity = Depends(resolve_owner)):
     """以 SSE 返回 SQL Agent 的完整执行过程。"""
-    # #region debug-point E:server-entry
-    await asyncio.to_thread(__import__('urllib.request', fromlist=['Request']).urlopen, __import__('urllib.request', fromlist=['Request']).Request('http://127.0.0.1:7777/event', data=json.dumps({'sessionId': 'sql-agent-stream', 'runId': 'pre', 'hypothesisId': 'E', 'location': 'examples/step13_fastapi/main.py:ask_sql_stream', 'msg': '[DEBUG] ask_sql_stream entered', 'data': {'session_id': req.session_id, 'mode': 'database'}}).encode(), headers={'Content-Type': 'application/json'}))
-    # #endregion
     rds = redis_client.client
     raw = await rds.hgetall(K_SESSION.format(sid=req.session_id))
     if not raw:
@@ -1027,9 +1024,6 @@ async def ask_sql_stream(req: AskRequest, owner: OwnerIdentity = Depends(resolve
     async def event_generator():
         try:
             async for event in _get_sql_agent().astream_events(req.question, db_path="hologres"):
-                # #region debug-point C:server-event
-                await asyncio.to_thread(__import__('urllib.request', fromlist=['Request']).urlopen, __import__('urllib.request', fromlist=['Request']).Request('http://127.0.0.1:7777/event', data=json.dumps({'sessionId': 'sql-agent-stream', 'runId': 'pre', 'hypothesisId': 'C', 'location': 'examples/step13_fastapi/main.py:event_generator', 'msg': '[DEBUG] SSE event yielded', 'data': {'event_type': event.get('type')}}).encode(), headers={'Content-Type': 'application/json'}))
-                # #endregion
                 if event.get("type") == "done":
                     await _append_history(req.session_id, "user", req.question)
                     await _append_history(req.session_id, "assistant", event["answer"])

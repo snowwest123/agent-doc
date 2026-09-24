@@ -32,10 +32,12 @@ export default function App() {
   const [createMode, setCreateMode] = useState<SessionMode>('knowledge');
   const [creating, setCreating] = useState(false);
   const [modeSwitching, setModeSwitching] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
   const { streaming, start, stop } = useStream();
 
   // 从后端拉全量会话（Hologres 持久化），刷新也不会丢
   const refreshSessions = useCallback(async () => {
+    setInitialLoading(true);
     try {
       const list = await listSessions();
       setSessions(list);
@@ -49,11 +51,12 @@ export default function App() {
       }
     } catch (err) {
       console.error('listSessions failed', err);
+      setInitialLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    refreshSessions();
+    void refreshSessions();
     const tick = async () => {
       try {
         const h = await healthCheck();
@@ -73,18 +76,19 @@ export default function App() {
       setBrainInfo(null);
       setMessages([]);
       setSuggestedQuestions([]);
+      setInitialLoading(false);
       return;
     }
     localStorage.setItem(CURRENT_SID_KEY, currentSid);
     let cancelled = false;
-    getSession(currentSid)
+    const sessionRequest = getSession(currentSid)
       .then((info) => {
         if (!cancelled) setBrainInfo(info);
       })
       .catch(() => {
         if (!cancelled) setBrainInfo(null);
       });
-    getHistory(currentSid)
+    const historyRequest = getHistory(currentSid)
       .then((history) => {
         if (cancelled) return;
         setMessages(
@@ -98,6 +102,9 @@ export default function App() {
       .catch(() => {
         if (!cancelled) setMessages([]);
       });
+    void Promise.all([sessionRequest, historyRequest]).finally(() => {
+      if (!cancelled) setInitialLoading(false);
+    });
     setSuggestedQuestions([]);
     return () => {
       cancelled = true;
@@ -254,7 +261,15 @@ export default function App() {
   );
 
   return (
-    <div className="h-full flex">
+    <div className="relative h-full flex">
+      {(initialLoading || modeSwitching) && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-white/70">
+          <Spin
+            size="large"
+            tip={initialLoading ? '正在加载会话历史...' : '正在切换会话模式...'}
+          />
+        </div>
+      )}
       <Sidebar
         sessions={sessions}
         currentSid={currentSid}
@@ -339,12 +354,14 @@ export default function App() {
                 </Radio.Group>
                 {brainInfo.mode !== 'knowledge' && (
                   <Tag color="orange" className="mt-1 block text-center">
-                    当前走 SQL 问答端点
+                    当前走 SQL 问答端点（您可以问b）
                   </Tag>
                 )}
               </div>
             </header>
-            <FileUpload sessionId={currentSid} onUploaded={handleUploaded} />
+            {brainInfo.mode === 'knowledge' && (
+              <FileUpload sessionId={currentSid} onUploaded={handleUploaded} />
+            )}
             <ChatWindow
               messages={messages}
               streaming={streaming}

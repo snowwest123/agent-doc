@@ -128,19 +128,6 @@ export async function askSqlStream(
   onEvent: (event: SqlStreamEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  // #region debug-point A:client-request
-  fetch('http://127.0.0.1:7777/event', {
-    method: 'POST',
-    body: JSON.stringify({
-      sessionId: 'sql-agent-stream',
-      runId: 'pre',
-      hypothesisId: 'A',
-      location: 'front/src/api.ts:askSqlStream',
-      msg: '[DEBUG] ask_sql_stream request started',
-      data: { base: BASE },
-    }),
-  }).catch(() => {});
-  // #endregion
   const r = await fetch(`${BASE}/ask_sql_stream`, {
     method: 'POST',
     headers: headers({ 'Content-Type': 'application/json' }),
@@ -154,19 +141,6 @@ export async function askSqlStream(
   let buf = '';
   while (true) {
     const { done, value } = await reader.read();
-    // #region debug-point D:client-chunk
-    fetch('http://127.0.0.1:7777/event', {
-      method: 'POST',
-      body: JSON.stringify({
-        sessionId: 'sql-agent-stream',
-        runId: 'pre',
-        hypothesisId: 'D',
-        location: 'front/src/api.ts:askSqlStream',
-        msg: '[DEBUG] SSE chunk received',
-        data: { done, bytes: value?.byteLength || 0 },
-      }),
-    }).catch(() => {});
-    // #endregion
     if (done) break;
     buf += decoder.decode(value, { stream: true });
     const blocks = buf.split('\n\n');

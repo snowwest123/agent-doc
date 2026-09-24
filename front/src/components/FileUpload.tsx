@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react';
+import { Spin } from 'antd';
 import { Upload, FileText, X } from 'lucide-react';
 import { getSuggestedQuestions, uploadFiles } from '../api';
 
@@ -14,11 +15,11 @@ export default function FileUpload({ sessionId, onUploaded }: Props) {
   const [uploading, setUploading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  async function handleUpload() {
-    if (files.length === 0) return;
+  async function handleUpload(selectedFiles: File[]) {
+    if (selectedFiles.length === 0) return;
     setUploading(true);
     try {
-      await uploadFiles(sessionId, files);
+      await uploadFiles(sessionId, selectedFiles);
       const questions = await getSuggestedQuestions(sessionId);
       setFiles([]);
       onUploaded(questions);
@@ -30,11 +31,17 @@ export default function FileUpload({ sessionId, onUploaded }: Props) {
   }
 
   return (
-    <div className="bg-white border-b border-slate-200 px-6 py-3">
+    <div className="relative bg-white border-b border-slate-200 px-6 py-3">
+      {uploading && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-white/70">
+          <Spin size="large" tip="正在上传并处理文件..." />
+        </div>
+      )}
       <div className="flex items-center gap-2 flex-wrap">
         <button
           onClick={() => inputRef.current?.click()}
-          className="flex items-center gap-1 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 rounded-md text-sm"
+          disabled={uploading}
+          className="flex items-center gap-1 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 rounded-md text-sm disabled:cursor-not-allowed disabled:opacity-50"
         >
           <Upload className="w-4 h-4" /> 请选择文件
         </button>
@@ -42,7 +49,7 @@ export default function FileUpload({ sessionId, onUploaded }: Props) {
           ref={inputRef}
           type="file"
           multiple
-          accept=".txt,.md,.csv"
+          accept=".txt"
           hidden
           onChange={(e) => {
             const selectedFiles = Array.from(e.target.files || []);
@@ -50,11 +57,13 @@ export default function FileUpload({ sessionId, onUploaded }: Props) {
               (file) => file.size > MAX_FILE_SIZE,
             );
             if (invalidFile) {
-              alert(`文件 ${invalidFile.name} 超过 10 MB 限制`);
+              alert(`文件 ${invalidFile.name} 超过 10 MB 限制，请重新选择`);
               e.target.value = '';
               return;
             }
             setFiles(selectedFiles);
+            void handleUpload(selectedFiles);
+            e.target.value = '';
           }}
         />
         {files.map((f) => (
@@ -68,14 +77,8 @@ export default function FileUpload({ sessionId, onUploaded }: Props) {
             </button>
           </span>
         ))}
-        {files.length > 0 && (
-          <button
-            onClick={handleUpload}
-            disabled={uploading}
-            className="ml-auto px-4 py-1.5 bg-primary-600 hover:bg-primary-700 text-white rounded-md text-sm disabled:opacity-50"
-          >
-            {uploading ? '上传中...' : `上传 ${files.length} 个文件`}
-          </button>
+        {uploading && (
+          <span className="ml-auto text-sm text-slate-500">上传中...</span>
         )}
       </div>
     </div>
